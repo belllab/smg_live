@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.21
+// @version          0.22
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -17,6 +17,13 @@
     'use strict';
     const UW = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const LS = (() => { try { return UW.localStorage || localStorage; } catch (e) { return localStorage; } })();
+    const DEV_LOG = false;
+    function dlog() {
+        if (!DEV_LOG) { return; }
+        try {
+            console.log.apply(console, ['[SMGTV]'].concat(Array.prototype.slice.call(arguments)));
+        } catch (e) {}
+    }
     const STYLE_ID = 'smgtv-unlock-style';
     const VIDEO_READY_CLASS = 'smgtv-video-ready';
     const FULLSCREEN_FALLBACK_CLASS = 'smgtv-fallback-fullscreen';
@@ -28,27 +35,16 @@
     const streamAddressCache = Object.create(null);
     const channelShiftBaseCache = Object.create(null);
     const channelLiveBaseCache = Object.create(null);
-    // 同一条播放地址上可能挂着两套期限：地址参数（如 volcTime / expire）与 token 里 JWT 的 exp。
-    // 视频服务器按“最早到期”的那个拒绝请求，缓存也必须按最早的那个淘汰，
-    // 否则会一直认为旧地址可用，拿已被 403 的地址反复播放。
-    const STREAM_RENEW_MARGIN_MS = 120000;        // 到期前多久开始换源
-    const STREAM_RENEW_COOLDOWN_MS = 60000;       // 两次主动换源之间的最小间隔
-    const BASE_SAFETY_MS = 5000;                  // 剩余寿命低于此值就不再算“可用”
-    const STREAM_NO_EXP_TTL_MS = 20 * 60 * 1000;  // 解析不出任何期限时的保守缓存寿命
-    const STREAM_ADDRESS_TTL_MS = 30 * 60 * 1000; // 接口回填地址的缓存寿命
-    // 停滞阈值必须明显大于 hls.js 自身的分片重试窗口（约 20s），
-    // 否则弱网下正常缓冲会被当成断流，把本可自愈的播放器拆掉
-    const STALL_TIMEOUT_MS = 30000;               // 画面停滞多久判定为断流
-    // 重建后新地址同样不可播时，currentTime 会永远停在 0，所有“画面不再前进”
-    // 的判据都失效，需要单独给一个更长的窗口兜这种情况
-    const STUCK_START_TIMEOUT_MS = 60000;         // 一直没起播多久判定为失败
-    const RECOVER_COOLDOWN_MS = 15000;            // 两次恢复尝试之间的最小间隔
-    const RECOVER_MAX_COOLDOWN_MS = 5 * 60 * 1000; // 反复恢复无效时的退避上限
-    // 回看进度记录只在「记下之后马上重建」时才有意义，超过这个窗口就作废，
-    // 避免之后一次无关的重建拿陈旧记录乱跳进度
+    const STREAM_RENEW_MARGIN_MS = 120000;
+    const STREAM_RENEW_COOLDOWN_MS = 60000;
+    const BASE_SAFETY_MS = 5000;
+    const STREAM_NO_EXP_TTL_MS = 20 * 60 * 1000;
+    const STREAM_ADDRESS_TTL_MS = 30 * 60 * 1000;
+    const STALL_TIMEOUT_MS = 30000;
+    const STUCK_START_TIMEOUT_MS = 60000;
+    const RECOVER_COOLDOWN_MS = 15000;
+    const RECOVER_MAX_COOLDOWN_MS = 5 * 60 * 1000;
     const RESUME_POSITION_TTL_MS = 90000;
-    // 自动换源拿到的是“往期节目的回看源”，非 10 频道当直播源注入会播出错内容，
-    // 因此只对确知可用的频道开启
     const AUTO_ACQUIRE_CHANNELS = ['10'];
     const SMG_API_SECRET = '28c8edde3d61a0411511d3b1866f0636';
     const SMG_API_VERSION = '2.42.23';
@@ -66,8 +62,6 @@
             const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
             const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
             const json = JSON.parse(atob(padded));
-            // exp 必须是个像样的时间戳。0 或负数只会出现在畸形/占位 token 里，
-            // 放行的话会一路传到缓存，被当成"解析出了真实期限"参与择优
             if (typeof json.exp !== 'number' || !(json.exp > 0)) return null;
             return json.exp * 1000;
         } catch (e) {
@@ -88,11 +82,8 @@
         if (n >= 1e8) return n * 1000;
         return null;
     }
-    // 只收明确表示“到期时间”的参数名。绝不能收 authtime/validtime 这类可能表示
-    // “签发时间”的名字——那会让一条刚拿到手的地址立刻被判成已过期。
     const STREAM_EXP_KEYS = ['volctime', 'volc_time', 'expire', 'expires', 'expiretime',
                              'expire_time', 'expiredtime', 'wstime', 'ws_time', 'exper'];
-    // 地址参数上的期限（火山源的 volcTime 等），这类期限通常比 JWT 的 exp 早得多
     function parseUrlTimeExpiry(url) {
         const now = Date.now();
         let min = null;
@@ -107,7 +98,6 @@
         } catch (e) {}
         return min;
     }
-    // token 不一定挂在 token 参数上，任何 JWT 形状的参数都算
     function parseUrlJwtExp(url) {
         const now = Date.now();
         let min = null;
@@ -115,21 +105,48 @@
             new URL(url).searchParams.forEach(value => {
                 if (value.split('.').length !== 3) return;
                 const t = parseJwtValueExp(value);
-                // 必须过滤：任意一个无关的三段式参数只要解出更早的 exp，
-                // 就能把整条地址的有效期拉到过去，导致可用地址被误判为已过期
                 if (t == null || t < now - 86400000 || t > now + 60 * 86400000) return;
                 if (min == null || t < min) min = t;
             });
         } catch (e) {}
         return min;
     }
-    // 一条地址上可能同时带多个期限，取最早的那个作为真正的有效期
     function parseStreamExpiry(url) {
         if (!url || typeof url !== 'string') return null;
         const candidates = [parseJwtExp(url), parseUrlJwtExp(url), parseUrlTimeExpiry(url)]
             .filter(t => t != null);
         if (!candidates.length) return null;
         return Math.min.apply(null, candidates);
+    }
+    function parseJwtValueIat(token) {
+        try {
+            if (!token || token.split('.').length !== 3) return null;
+            const payload = token.split('.')[1];
+            if (!payload) return null;
+            const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+            const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+            const json = JSON.parse(atob(padded));
+            if (typeof json.iat !== 'number' || !(json.iat > 0)) return null;
+            return json.iat * 1000;
+        } catch (e) {
+            return null;
+        }
+    }
+    function parseStreamIssuedAt(url) {
+        if (!url || typeof url !== 'string') return null;
+        let token = null;
+        try {
+            const u = new URL(url);
+            token = u.searchParams.get('token');
+            if (!token) {
+                u.searchParams.forEach(value => {
+                    if (!token && value.split('.').length === 3) token = value;
+                });
+            }
+        } catch (e) {
+            return null;
+        }
+        return parseJwtValueIat(token);
     }
     function smgMd5(str) {
         function rl(n, c) { return (n << c) | (n >>> (32 - c)); }
@@ -264,8 +281,6 @@
         const url = 'https://kapi.kankanews.com' + path + (q ? '?' + q : '');
         let pageFetch;
         try {
-            // 页面 fetch 没有超时，一旦挂住会让 __smgAcquiring 永远为真、换源彻底停摆，
-            // 这里限时后退回 GM 请求（GM 自带 15s 超时）
             const opts = { headers: headers };
             let timer = null;
             if (typeof UW.AbortController === 'function') {
@@ -384,8 +399,6 @@
         if (!cached) {
             return false;
         }
-        // 不把已经放太久的地址回填给页面，否则页面会以为手里还有可播的源，
-        // 重建播放器时继续拿到旧地址
         if (Date.now() - (cached.at || 0) > STREAM_ADDRESS_TTL_MS) {
             delete streamAddressCache[String(channelId)];
             return false;
@@ -488,47 +501,56 @@
     function canAutoAcquire(channelId) {
         return channelId != null && AUTO_ACQUIRE_CHANNELS.indexOf(String(channelId)) !== -1;
     }
-    // 缓存条目的真实有效期可能解析不出来，此时退回按写入时间估算的保守寿命，
-    // 避免一条判定不出期限的地址被无限期复用
     function baseExpiryOf(entry) {
         if (!entry) return 0;
-        // 必须用 != null 而不是真值判断：写成 if (entry.exp) 的话 exp 为 0
-        // 会掉进兜底分支拿到「写入时间 + 20 分钟」的假寿命，
-        // 反而让这条早已过期的地址变得"可用"，而 betterBase 那边又按「有 exp」优先选它
         if (entry.exp != null) return entry.exp;
         return (entry.at || 0) + STREAM_NO_EXP_TTL_MS;
     }
-    // 两条候选谁更该用。不能只比 baseExpiryOf：
-    // 两边都解析不出期限时会退化成纯比写入时间，而页面回填的那条总是写得更晚，
-    // 于是脚本刚取到的新源永远选不上，「强制换源」就变成了空转。
     function betterBase(a, b) {
         if (!a) return b;
         if (!b) return a;
         const aHasExp = a.exp != null;
         const bHasExp = b.exp != null;
         if (aHasExp !== bHasExp) {
-            return aHasExp ? a : b;                       // 解析得出真实期限的更可信
+            return aHasExp ? a : b;
         }
         const aScript = a.src === 'script';
         const bScript = b.src === 'script';
         if (aScript !== bScript) {
-            return aScript ? a : b;                       // 脚本取到的比页面回填的可信
+            return aScript ? a : b;
         }
         return baseExpiryOf(a) >= baseExpiryOf(b) ? a : b;
     }
-    // kind === 'shift' 时只取回看源——回看必须只认回看源，
-    // 拿直播地址去拼接 start/end 会被服务端拒绝。
-    // 其余情况两个缓存都看：自动取源拿到的地址只写进 shift 缓存，
-    // 把直播限定成只查 live 缓存会让新取的源永远注入不进去。
-    function resolveBaseEntry(channelId, kind) {
+    function playbackKey(component) {
+        if (!component) return '';
+        const program = component.programObj;
+        const channelId = getCompChannelId(component);
+        if (channelId == null || !program) return '';
+        const pid = program.id != null ? program.id
+            : (program.start_time != null ? program.start_time : '');
+        if (pid === '') return '';
+        return channelId + '|' + pid;
+    }
+    function resolveBaseEntry(channelId, kind, key) {
         const now = Date.now();
         if (channelId == null) return null;
         const candidates = kind === 'shift' ? [channelShiftBaseCache[channelId]]
             : [channelShiftBaseCache[channelId], channelLiveBaseCache[channelId]];
         const usable = candidates
-            .filter(entry => entry && entry.url && baseExpiryOf(entry) - BASE_SAFETY_MS > now);
-        if (!usable.length) return null;
-        return usable.reduce(betterBase);
+            .filter(entry => entry && entry.url && baseExpiryOf(entry) - BASE_SAFETY_MS > now &&
+                             (!key || !entry.key || entry.key === key));
+        if (!usable.length) {
+            throttleLog('base-miss-' + channelId, 3000, () => {
+                dlog('[dev] 基底未命中 ch=' + channelId, 'kind=' + (kind || 'live'), 'key=' + (key || '-'));
+            });
+            return null;
+        }
+        const best = usable.reduce(betterBase);
+        throttleLog('base-hit-' + channelId, 3000, () => {
+            dlog('[dev] 基底命中 ch=' + channelId, 'src=' + best.src,
+                 '剩余=' + Math.round((baseExpiryOf(best) - now) / 1000) + 's');
+        });
+        return best;
     }
     function installReplayUrlPatch(component) {
         const XGPlayer = component.$xgplayer;
@@ -549,17 +571,10 @@
                     if (base) {
                         const fromShift = /[?&]start=\d+/.test(url);
                         const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
-                        const entry = { url: base, at: Date.now(), exp: parseStreamExpiry(url), src: 'page' };
-                        // 页面重建播放器时可能塞回来一条已经过期的地址，
-                        // 不能用它把已经取到的新源覆盖掉。
-                        // 注意这里要单独判断 exp 是否为空——baseExpiryOf 对空 exp 会兜底成
-                        // 「写入时间 + 20 分钟」，直接比大小会让新地址反而输给旧条目。
+                        const entry = { url: base, at: Date.now(), exp: parseStreamExpiry(url),
+                                        key: playbackKey(component), src: 'page' };
                         const prev = store[channelId];
-                        // 这里只比较期限。还有一条判据是「脚本取到的比页面回填的可信」，
-                        // 但它放在 betterBase 里按来源比较，不在这里做——
-                        // 写成"保护期内拒绝页面条目"会让保护期随每次重新取源顺延，
-                        // 接口持续返回坏地址时，页面那条可用地址就被永久挡在门外了。
-                        const canStore = !prev ||
+                        const canStore = !prev || prev.key !== entry.key ||
                               (entry.exp != null && (prev.exp == null || entry.exp >= prev.exp)) ||
                               (entry.exp == null && prev.exp == null);
                         if (canStore) {
@@ -569,25 +584,22 @@
                     }
                 }
                 const isReplay = config.isLive === false;
-                // 回看必须只认回看源（拿直播地址拼 start/end 会被服务端拒绝）。
-                // 直播则要看两个缓存：自动取源拿到的地址只写进 shift 缓存
-                // （见 fetchShiftByDonor），只查 live 缓存会让它永远看不见新取的源。
-                const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '');
+                const pbKey = playbackKey(component);
+                const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '', pbKey);
                 const baseOk = baseEntry ? baseEntry.url : '';
-                // 页面自带的地址可能已经过期（地址参数上的期限比 JWT 早得多）。
-                // 只要判定它已失效，就不能再原样放行，必须换成脚本重新取到的源。
                 const urlExp = parseStreamExpiry(url);
                 const urlStale = hasStream && urlExp != null && urlExp - BASE_SAFETY_MS <= Date.now();
-                // 标记只影响紧接着的这一次构造。注意不能在这里无条件清掉：
-                // 一次与目标无关的兜底重建会把标记吃掉，等在飞的取源回来时已经失去 forcing。
-                // 真正的清零点在下面“确实用它换掉了页面地址”的分支里。
                 const forcing = Date.now() < (component.__smgPreferFreshBaseUntil || 0);
-                // forcing 只会由 forceRenewStream 置位，而它只在白名单频道真的取到源时才有效，
-                // 所以这里的 forcing 项不需要再判一次白名单
                 const staleTrigger = urlStale && (isReplay || canAutoAcquire(channelId));
                 const preferBase = !!baseEntry &&
                       (!hasStream || staleTrigger || (forcing && baseExpiryOf(baseEntry) > (urlExp || 0)));
+                dlog('[dev] new播放器 ch=' + channelId, 'key=' + (pbKey || '-'), 'isLive=', config.isLive,
+                     'url=' + (url || '(空)'), 'base=' + (baseEntry ? baseEntry.src : '无'),
+                     'preferBase=', preferBase, 'staleTrigger=', staleTrigger, 'hasWindow=', hasWindow,
+                     'play=' + (program ? program.play : '-'),
+                     'prog=' + (program && program.name ? String(program.name).slice(0, 12) : '-'));
                 if (isReplay && hasWindow) {
+                    dlog('[dev] 页面自带 start/end，不改写');
                     return new target(...args);
                 }
                 if (isReplay && hasStream && !hasWindow && program?.start_time && program?.end_time) {
@@ -607,6 +619,7 @@
                         console.log('[SMGTV] 已注入回放 频道' + channelId);
                     } else {
                         component.__smgNeedShiftBase = true;
+                        dlog('[dev] 回看无基底可注入 → 标记待取源');
                     }
                 } else if (!isReplay) {
                     if (preferBase) {
@@ -614,12 +627,10 @@
                         component.__smgPreferFreshBaseUntil = 0;
                         console.log('[SMGTV] 已注入直播 频道' + channelId + (urlStale ? '（旧地址已过期）' : ''));
                     } else if (!hasStream || staleTrigger) {
-                        // 手上没有可用的源，或页面给的这条已经过期：请求重新取源。
-                        // 「已过期」这条跟着自动取源的白名单走：非白名单频道拿不到新源，
-                        // 而 shift 缓存里可能是从页面回看地址抓来的回看源，贸然注入会播出错内容
                         component.__smgNeedShiftBase = true;
                     }
                 }
+                dlog('[dev] 最终 url=' + (config.url || '(空)'));
                 return new target(...args);
             }
         });
@@ -634,8 +645,7 @@
                 const channelId = getCompChannelId(this);
                 const current = typeof opts.url === 'string' ? opts.url : '';
                 const isReplay = opts.isLive === false;
-                // 回看只认回看源；直播要看两个缓存（自动取源只写 shift 缓存）
-                const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '');
+                const baseEntry = resolveBaseEntry(channelId, isReplay ? 'shift' : '', playbackKey(this));
                 const currentExp = parseStreamExpiry(current);
                 const currentStale = !!current && currentExp != null && currentExp - BASE_SAFETY_MS <= Date.now();
                 const canInject = !!baseEntry && (!isReplay || (program?.start_time && program?.end_time));
@@ -650,9 +660,8 @@
                     component.__smgPreferFreshBaseUntil = 0;
                     console.log('[SMGTV] 已注入' + (isReplay ? '回放' : '直播') + ' 频道' + channelId);
                 } else if ((!current || (currentStale && (isReplay || canAutoAcquire(channelId)))) && channelId != null) {
-                    // 手上没有可用的源、或页面给的这条已经过期：请求重新取源。
-                    // 原来只在 current 为空时置位，过期地址会被原样放行
                     component.__smgNeedShiftBase = true;
+                    dlog('[dev] M站无基底可注入 → 标记待取源 url=' + (current || '(空)'));
                 }
             }
             return original.apply(this, arguments);
@@ -694,7 +703,10 @@
             .then(res => {
             const detail = res && res.result;
             const enc = detail && detail.channel_info && detail.channel_info.shift_address;
-            if (!enc) return null;
+            if (!enc) {
+                dlog('[dev] donor detail 无 shift_address, donorId=' + donorId);
+                return null;
+            }
             return new Promise(resolve => {
                 decryptRsaChunks(enc, url => {
                     if (!url) return resolve(null);
@@ -703,13 +715,14 @@
                         u.searchParams.delete('start');
                         u.searchParams.delete('end');
                         const base = u.toString();
-                        // 不解析期限时不要兜底成 12 小时——那正是让过期地址被长期复用的原因
                         channelShiftBaseCache[channelId] = {
                             url: base,
                             at: Date.now(),
                             exp: parseStreamExpiry(url),
                             src: 'script'
                         };
+                        dlog('[dev] 解密成功 路径=' + u.pathname,
+                             '剩余=' + Math.round(((parseStreamExpiry(url) || 0) - Date.now()) / 1000) + 's');
                         console.log('[SMGTV] 已获取回看源');
                         resolve(base);
                     } catch (e) {
@@ -720,6 +733,8 @@
         });
     }
     function acquireShiftBase(channelId, component) {
+        const key = playbackKey(component);
+        dlog('[dev] acquire开始 ch=' + channelId, 'key=' + (key || '-'));
         let candidate;
         if (component) {
             const todayId = findTodayDonorId(component);
@@ -750,7 +765,6 @@
             });
         });
     }
-    // 返回是否真的发起了取源（被冷却/正在取源挡住时返回 false，调用方据此走兜底）
     function maybeAutoCaptureShift(component, fromMonitor, opts) {
         opts = opts || {};
         if (!component || !component.__smgPatched || !component.__smgNeedShiftBase || !fromMonitor) {
@@ -762,21 +776,26 @@
         }
         if (!canAutoAcquire(chId)) {
             component.__smgNeedShiftBase = false;
+            dlog('[dev] 跳过取源：频道不在自动列表 ch=' + chId);
             return false;
         }
         const now = Date.now();
-        const hasBase = !!resolveBaseEntry(chId);
-        // force 用于“手上这条地址已经失效，必须换一条新的”的场景：
-        // 此时即使缓存里还有条目也要重新取，取到的新地址会覆盖旧条目
+        const pbKey = playbackKey(component);
+        const replayProg = component.programObj?.play === 0;
+        const hasBase = !!resolveBaseEntry(chId, replayProg ? 'shift' : '', pbKey);
         if (hasBase && !opts.force) {
             component.__smgNeedShiftBase = false;
+            dlog('[dev] 跳过取源：已有可用基底 key=' + (pbKey || '-'));
             return false;
         }
         const cooldownKey = '__smgShiftCooldown';
         if (component.__smgAcquiring) {
+            dlog('[dev] 跳过取源：正在取源中');
             return false;
         }
         if (now - (component[cooldownKey] || 0) < 60000) {
+            dlog('[dev] 跳过取源：冷却中 剩余=' +
+                 Math.round((60000 - (now - component[cooldownKey])) / 1000) + 's');
             return false;
         }
         component[cooldownKey] = now;
@@ -785,13 +804,7 @@
             component.__smgAcquiring = false;
             if (ok) {
                 component.__smgNeedShiftBase = false;
-                // 注意：这里不重置 __smgAcquireFails。取到一条非空地址不等于它能播，
-                // 只看“取到了”就清零会让持续给坏地址的接口无限循环取源。
-                // 失败计数改由“画面确实在推进”时清零（见 detectPlaybackFailure）。
                 if (component && typeof component.initPlayer === 'function' && opts.rebuild !== false) {
-                    // 取源是异步的，快则几十毫秒慢则几秒。进度记录是在发起取源前那一刻记的，
-                    // 到这里可能已经吃掉不小一段 90 秒的有效期；重建前重记一次，
-                    // 让这个窗口从真正重建的时刻开始算
                     rememberPlaybackPosition(component, getPlayerVideo(component));
                     if (isMobileSite()) {
                         const prog = component.programObj;
@@ -810,8 +823,6 @@
         });
         return true;
     }
-    // 重新取一条新的播放源。取到的新地址会覆盖缓存里的旧条目，
-    // 因此取源失败也不会把手上还能用的地址弄丢。
     function forceRenewStream(component, reason, rebuild) {
         const chId = getCompChannelId(component);
         if (chId == null) {
@@ -822,44 +833,28 @@
         });
         component.__smgNeedShiftBase = true;
         if (rebuild) {
-            // 让紧随其后的播放器重建优先用新取到的源，而不是页面塞回来的旧地址
             component.__smgPreferFreshBaseUntil = Date.now() + 30000;
         }
-        // 返回“是否真的发起了取源”：冷却期内会返回 false，此时调用方需要走兜底重建，
-        // 否则日志报了“正在恢复”却什么都没发生
         return maybeAutoCaptureShift(component, true, { force: true, rebuild: rebuild !== false });
     }
-    // 断流判定。原来只看 mediaError.code === 4，但 hls.js 在网络中断时
-    // 不会写 HTMLMediaElement.error，只会表现为 currentTime 不再前进，
-    // 因此两种信号都要看。
     function detectPlaybackFailure(component, video) {
         if (!video) {
             return null;
         }
-        // 用户主动暂停 / 播放结束 / 拖动 优先判断：
-        // 元素上可能残留一次瞬时错误，不能因此把用户按下的暂停推翻
         if (video.paused || video.ended || video.seeking) {
             component.__smgStallWatch = null;
             clearStuckStart(component);
             return null;
         }
-        // 媒体错误要排在 currentTime 判断之前：地址不可播时 currentTime 会一直停在 0，
-        // 若被 currentTime<1 提前 return 掉，这个最明确的故障信号就永远看不到了
         const err = video.error;
-        // code 1 = MEDIA_ERR_ABORTED，切换 src 时就会出现，不是真的故障
         if (err && err.code !== 1) {
             component.__smgStallWatch = null;
             return '媒体错误 code=' + err.code;
         }
         const now = Date.now();
         if (video.currentTime < 1) {
-            // 一直起不来：重建后注入的地址同样不可播时，currentTime 会永远停在 0，
-            // 上面所有基于“画面不再前进”的判据都不成立，只能靠一个更长的窗口兜底
             component.__smgStallWatch = null;
             const rs = video.readyState;
-            // 计时必须能被打断重来，否则会误伤正常场景：
-            //  - 换了播放器 / readyState 回退（重建会把加载推倒重来）
-            //  - readyState 前进（说明数据还在到，只是起播慢，弱网下很常见）
             if (component.__smgStuckVideo !== video || component.__smgStuckAt == null ||
                     rs !== (component.__smgStuckReady || 0)) {
                 component.__smgStuckVideo = video;
@@ -867,7 +862,6 @@
                 component.__smgStuckAt = now;
                 return null;
             }
-            // 数据完全取不到（NETWORK_NO_SOURCE）：不用等满窗口，这是明确的加载失败
             if (video.networkState === 3) {
                 return '源无法加载';
             }
@@ -879,13 +873,10 @@
         clearStuckStart(component);
         const watch = component.__smgStallWatch;
         if (!watch || watch.video !== video) {
-            // 换了播放器元素，基准时钟要重设，但**不能**顺带清零恢复计数：
-            // 否则每次重建都会把退避打回最短期，退避形同虚设
             component.__smgStallWatch = { video: video, time: video.currentTime, at: now };
             return null;
         }
         if (video.currentTime > watch.time + 0.25) {
-            // 画面确实在向前推进 —— 说明播放正常，恢复计数与取源失败计数一起清零
             component.__smgRecoverCount = 0;
             component.__smgAcquireFails = 0;
             watch.time = video.currentTime;
@@ -893,8 +884,6 @@
             return null;
         }
         if (video.currentTime < watch.time - 0.25) {
-            // 回退（播放器重建、用户拖动）：只重设基准时钟，不计为“播放正常”，
-            // 否则重建后 currentTime 归零会被当成进度，把退避计数清掉
             watch.time = video.currentTime;
             watch.at = now;
             return null;
@@ -909,9 +898,6 @@
         component.__smgStuckVideo = null;
         component.__smgStuckReady = 0;
     }
-    // 回看重启会从节目开头重新注入整段窗口，先把进度记下来，重建后跳回原处。
-    // 记录必须绑定到“被换掉的那个播放器”上：旧播放器在取源期间仍在派发
-    // timeupdate，不绑元素的话它会在自己身上把记录消费掉，新播放器就无从恢复。
     function rememberPlaybackPosition(component, video) {
         if (!video || !(video.currentTime > 5)) {
             return;
@@ -930,22 +916,13 @@
         if (at == null || !video) {
             return;
         }
-        // 记录只在「记下之后马上重建」这个前提下才有意义。取源可能被冷却挡住根本没重建，
-        // 记录就会一直留着，之后任何一次无关的重建（同频道换节目等）都会拿它乱跳进度，
-        // 所以超过这个窗口的记录直接作废
         if (Date.now() - (component.__smgResumeAt_ts || 0) > RESUME_POSITION_TTL_MS) {
             clearResumePosition(component);
             return;
         }
-        // 用户正在拖动进度条：此时 currentTime 会短暂落到记录位置之前，
-        // 不拦的话下面会判定成"进度被打回了"并把用户拽回原处
         if (video.seeking) {
             return;
         }
-        // 记录是针对被换掉的那个播放器存的。旧播放器在异步取源期间仍在派发 timeupdate，
-        // 在那上面消费记录会让重建后的新播放器无从恢复进度。
-        // 判据取两种信号：换了 video 元素，或者同一元素的 currentTime 被明显打回
-        // （xgplayer 重建时也可能复用同一个元素，只比元素身份会漏掉这种情况）。
         if (component.__smgResumeVideo === video && video.currentTime >= at - 3) {
             return;
         }
@@ -953,17 +930,12 @@
             return;
         }
         if (!isFinite(video.duration)) {
-            // duration 是 NaN 说明元数据还没到位，这时不能把记录清掉，
-            // 否则回看的进度会在重建后被永久丢弃（isFinite(NaN) 同样是 false）
             if (!isNaN(video.duration)) {
-                // Infinity = 直播流，跳进度没有意义（要的是最新画面）
                 clearResumePosition(component);
             }
             return;
         }
         clearResumePosition(component);
-        // 记下的位置是针对原来那个节目的。若新播放器的时长比它还短，说明换节目了，
-        // 硬跳过去会被浏览器钳到片尾直接播完
         if (at > video.duration - 2) {
             return;
         }
@@ -987,32 +959,23 @@
         if (!reason) {
             return;
         }
-        // 恢复次数不设上限（原先是 3 次本场直播永久不再恢复），改成逐次拉长的退避：
-        // 只要画面恢复推进会立刻清零，所以正常场景永远退避不到很后面
         component.__smgRecoverCount = (component.__smgRecoverCount || 0) + 1;
         const backoff = Math.min(
             RECOVER_COOLDOWN_MS * Math.pow(2, Math.min(component.__smgRecoverCount - 1, 5)),
             RECOVER_MAX_COOLDOWN_MS);
         component.__smgRecoveringUntil = now + backoff;
-        // 清掉停滞基准，让重建后的播放器重新计时。
-        // 这一步不会再顺带清零恢复计数——清零只发生在「画面确实向前推进」时，
-        // 否则每次重建都把退避打回 15 秒，指数退避和 5 分钟上限就永远用不上。
         component.__smgStallWatch = null;
-        // 「一直未能起播」的计时属于上一台播放器，重建后要重新开始算
         clearStuckStart(component);
         throttleLog('recover-log', 30000, () => {
             console.log('[SMGTV] 播放中断（' + reason + '），第 ' + component.__smgRecoverCount + ' 次恢复');
         });
+        dlog('[dev] 恢复重建 原因=' + reason, '退避=' + Math.round(backoff / 1000) + 's');
         rememberPlaybackPosition(component, video);
         ensurePlayableStream(component);
-        // 先换源再重建：只重建而不换源，拿回来的还是那条已经失效的地址。
-        // 但若取源正处在冷却期（没真的发起），必须退回裸重建，否则这一轮恢复是空转的。
         if (!forceRenewStream(component, reason, true)) {
             component.initPlayer({ changeCurrentList: false, isPlay: true, trigger: 'click' });
         }
     }
-    // 切频道后，上一个频道留下的冷却与失败计数会继续压着新频道
-    // （最坏情况切台后 10 分钟无法自动取源），换了频道就清掉
     function resetChannelScopedState(component) {
         const chId = getCompChannelId(component);
         if (chId == null || chId === component.__smgLastChannelId) {
@@ -1025,6 +988,7 @@
         component.__smgNeedShiftBase = false;
         component.__smgLastRenewAt = 0;
         component.__smgLastRenewRebuildAt = 0;
+        component.__smgRenewedExp = 0;
         component.__smgRecoveringUntil = 0;
         component.__smgRecoverCount = 0;
         component.__smgStallWatch = null;
@@ -1032,34 +996,46 @@
         component.__smgPreferFreshBaseUntil = 0;
         clearStuckStart(component);
     }
-    // 主动续期：与其等画面断掉再救，不如在地址到期前就把新源取回来。
-    // 只刷新缓存，不重建播放器——重建会打断正在播放的画面。
     function maintainStreamFreshness(component) {
         const chId = getCompChannelId(component);
         if (chId == null) {
             return;
         }
-        // 要看的是**正在播放的那一条**。取两个缓存里期限最晚的那条会漏掉回看场景：
-        // 先看过直播时 live 缓存里留着一条期限很长的地址，于是回看源快到期了也判定为“还早”，
-        // 主动续期就永远不会触发。判断口径必须与注入端 resolveBaseEntry 保持一致。
-        const entry = resolveBaseEntry(chId, component.programObj?.play === 0 ? 'shift' : '');
-        if (!entry) {
+        const kind = component.programObj?.play === 0 ? 'shift' : '';
+        const entry = resolveBaseEntry(chId, kind, playbackKey(component));
+        const now = Date.now();
+        const probe = entry ? null : probePlayerUrl(component);
+        const exp = entry ? baseExpiryOf(entry) : (probe ? probe.exp : null);
+        if (!exp) {
+            throttleLog('renew-check-' + chId, 15000, () => {
+                dlog('[dev] 续期检查：播放地址解析不出期限，跳过');
+            });
             return;
         }
-        const now = Date.now();
-        // 提前量按寿命比例收缩：长寿命源用固定的 2 分钟，
-        // 短寿命源不能比它自己的寿命还长，否则会一直触发
-        const lifetime = Math.max(baseExpiryOf(entry) - (entry.at || 0), 60000);
-        const margin = Math.min(STREAM_RENEW_MARGIN_MS, Math.max(lifetime * 0.15, 15000));
-        if (baseExpiryOf(entry) - now > margin) {
+        const anchor = (entry && entry.at) || (probe && probe.iat) ||
+            (exp - STREAM_NO_EXP_TTL_MS);
+        const lifetime = Math.max(Math.min(exp - anchor, 3600000), 60000);
+        const margin = entry
+            ? Math.min(STREAM_RENEW_MARGIN_MS, Math.max(lifetime * 0.15, 15000))
+            : STREAM_RENEW_MARGIN_MS;
+        const left = exp - now;
+        throttleLog('renew-check-' + chId, 15000, () => {
+            dlog('[dev] 续期检查：剩余=' + Math.round(left / 1000) + 's',
+                 '阈值=' + Math.round(margin / 1000) + 's',
+                 '来源=' + (entry ? entry.src : 'url'));
+        });
+        if (left > margin) {
+            return;
+        }
+        if (component.__smgRenewedExp === exp) {
+            dlog('[dev] 该期限已续期过，不再重复');
             return;
         }
         if (now - (component.__smgLastRenewAt || 0) < STREAM_RENEW_COOLDOWN_MS) {
             return;
         }
         component.__smgLastRenewAt = now;
-        // 仅在画面还是好的、且距上次重建足够久时才重建播放器，
-        // 避免短寿命源被反复打断
+        component.__smgRenewedExp = exp;
         const video = getPlayerVideo(component);
         const playing = isVideoReady(video);
         const rebuildGap = Math.max(60000, lifetime * 0.4);
@@ -1143,6 +1119,30 @@
             }
         }
         return null;
+    }
+    let urlExpProbe = { url: '', exp: null, iat: null };
+    function probePlayerUrl(component) {
+        const url = currentPlayerUrl(component);
+        if (!url) {
+            return { url: '', exp: null, iat: null };
+        }
+        if (url === urlExpProbe.url) {
+            return urlExpProbe;
+        }
+        urlExpProbe = { url: url, exp: parseStreamExpiry(url), iat: parseStreamIssuedAt(url) };
+        return urlExpProbe;
+    }
+    function currentPlayerUrl(component) {
+        const video = getPlayerVideo(component);
+        const src = video && typeof video.src === 'string' ? video.src : '';
+        if (src && /\.m3u8/.test(src)) {
+            return src;
+        }
+        const cfg = component?.player?.config;
+        if (cfg && typeof cfg.url === 'string') {
+            return cfg.url;
+        }
+        return src || '';
     }
     function getPlayerVideo(component) {
         const player = component?.player;
@@ -1459,12 +1459,16 @@
             return;
         }
         const wrapped = function() {
+            if (DEV_LOG && (methodName === 'initPlayer' || methodName === 'changeProgram')) {
+                const a0 = arguments[0] || {};
+                dlog('[dev] ' + methodName + ' 进入', 'url=' + (typeof a0.url === 'string' ? (a0.url || '(空)') : '-'),
+                     'isLive=' + a0.isLive, 'prog=' + (this.programObj?.name ? String(this.programObj.name).slice(0, 12) : '-'));
+            }
             const programId = this.programObj?.id;
             if (programId && programId !== this.__smgRecoverProgramId) {
                 this.__smgRecoverProgramId = programId;
                 this.__smgRecoverCount = 0;
-                // 换了节目，上一个节目的进度记录就不再是对这个视频有效的目标，
-                // 留着会让下一次重建把新节目拖到旧节目的时间点上
+                this.__smgRenewedExp = 0;
                 clearResumePosition(this);
             }
             ensurePlayableStream(this);
