@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.22
+// @version          0.23
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -38,6 +38,11 @@
     const STREAM_RENEW_MARGIN_MS = 120000;
     const STREAM_RENEW_COOLDOWN_MS = 60000;
     const BASE_SAFETY_MS = 5000;
+    const SCAN_DAYS_PER_TRY = 2;
+    const SCAN_STEP_DELAY_MS = 1200;
+    const DONOR_MEMO_TTL_MS = 30 * 60 * 1000;
+    const shiftScanCursor = Object.create(null);
+    const donorMemo = Object.create(null);
     const STREAM_NO_EXP_TTL_MS = 20 * 60 * 1000;
     const STREAM_ADDRESS_TTL_MS = 30 * 60 * 1000;
     const STALL_TIMEOUT_MS = 30000;
@@ -272,7 +277,25 @@
             }
         });
     }
+    const API_MIN_INTERVAL_MS = 800;
+    let apiLastAt = 0;
+    let apiQueue = Promise.resolve();
+    function scheduleApiCall(task) {
+        const run = () => {
+            const wait = Math.max(0, API_MIN_INTERVAL_MS - (Date.now() - apiLastAt));
+            return new Promise(resolve => setTimeout(resolve, wait)).then(() => {
+                apiLastAt = Date.now();
+                return task();
+            });
+        };
+        const next = apiQueue.then(run, run);
+        apiQueue = next.then(() => {}, () => {});
+        return next;
+    }
     function smgApiGet(path, params) {
+        return scheduleApiCall(() => apiGetNow(path, params));
+    }
+    function apiGetNow(path, params) {
         const signed = smgSignParams(params || {});
         const q = Object.keys(params || {}).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k])).join('&');
         const headers = { Accept: 'application/json, text/plain, */*' };
@@ -538,7 +561,7 @@
             : [channelShiftBaseCache[channelId], channelLiveBaseCache[channelId]];
         const usable = candidates
             .filter(entry => entry && entry.url && baseExpiryOf(entry) - BASE_SAFETY_MS > now &&
-                             (!key || !entry.key || entry.key === key));
+                             (kind === 'shift' || !key || !entry.key || entry.key === key));
         if (!usable.length) {
             throttleLog('base-miss-' + channelId, 3000, () => {
                 dlog('[dev] 基底未命中 ch=' + channelId, 'kind=' + (kind || 'live'), 'key=' + (key || '-'));
@@ -572,7 +595,7 @@
                         const fromShift = /[?&]start=\d+/.test(url);
                         const store = fromShift ? channelShiftBaseCache : channelLiveBaseCache;
                         const entry = { url: base, at: Date.now(), exp: parseStreamExpiry(url),
-                                        key: playbackKey(component), src: 'page' };
+                                        key: fromShift ? '' : playbackKey(component), src: 'page' };
                         const prev = store[channelId];
                         const canStore = !prev || prev.key !== entry.key ||
                               (entry.exp != null && (prev.exp == null || entry.exp >= prev.exp)) ||
@@ -719,8 +742,10 @@
                             url: base,
                             at: Date.now(),
                             exp: parseStreamExpiry(url),
+                            key: '',
                             src: 'script'
                         };
+                        donorMemo[channelId] = { id: donorId, at: Date.now() };
                         dlog('[dev] 解密成功 路径=' + u.pathname,
                              '剩余=' + Math.round(((parseStreamExpiry(url) || 0) - Date.now()) / 1000) + 's');
                         console.log('[SMGTV] 已获取回看源');
@@ -732,38 +757,107 @@
             });
         });
     }
-    function acquireShiftBase(channelId, component) {
-        const key = playbackKey(component);
-        dlog('[dev] acquire开始 ch=' + channelId, 'key=' + (key || '-'));
+    function probeDonorDay(channelId, daysAgo) {
+        return smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(daysAgo) })
+            .then(res => {
+                const id = findDonorIdFromList(res && res.result && res.result.programs);
+                if (!id) {
+                    return null;
+                }
+                return fetchShiftByDonor(channelId, id);
+            });
+    }
+    function scanPastDays(channelId) {
+        const start = shiftScanCursor[channelId] || 1;
+        let probed = 0;
+        const step = daysAgo => {
+            if (daysAgo > 7) {
+                shiftScanCursor[channelId] = 1;
+                console.warn('[SMGTV] 7天内未找到可用的回看源');
+                return Promise.resolve(null);
+            }
+            return probeDonorDay(channelId, daysAgo).then(url => {
+                if (url) {
+                    shiftScanCursor[channelId] = 1;
+                    return url;
+                }
+                shiftScanCursor[channelId] = daysAgo + 1;
+                probed += 1;
+                if (probed >= SCAN_DAYS_PER_TRY) {
+                    dlog('[dev] 本次取源已探 ' + probed + ' 天, 游标停在第 ' + (daysAgo + 1) + ' 天');
+                    return null;
+                }
+                return new Promise(resolve => setTimeout(resolve, SCAN_STEP_DELAY_MS))
+                    .then(() => step(daysAgo + 1));
+            });
+        };
+        return step(start);
+    }
+    function acquireFromToday(channelId, component) {
         let candidate;
         if (component) {
             const todayId = findTodayDonorId(component);
-            if (todayId) candidate = todayId;
+            if (todayId) {
+                candidate = todayId;
+            }
         }
         if (!candidate) {
-            const listPromise = smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(0) });
-            return listPromise.then(res => {
-                const id = findDonorIdFromList(res && res.result && res.result.programs);
-                if (id) return fetchShiftByDonor(channelId, id).then(url => url || scanPast(channelId, 1));
-                return scanPast(channelId, 1);
-            });
+            return smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(0) })
+                .then(res => {
+                    const id = findDonorIdFromList(res && res.result && res.result.programs);
+                    if (id) {
+                        return fetchShiftByDonor(channelId, id).then(url => url || scanPastDays(channelId));
+                    }
+                    return scanPastDays(channelId);
+                });
         }
-        return fetchShiftByDonor(channelId, candidate).then(url => url || scanPast(channelId, 1));
+        return fetchShiftByDonor(channelId, candidate).then(url => url || scanPastDays(channelId));
     }
-    function scanPast(channelId, daysAgo) {
-        if (daysAgo > 7) {
-            console.warn('[SMGTV] 7天内未找到可用的回看源');
-            return Promise.resolve(null);
-        }
-        return smgApiGet('/content/pc/tv/programs', { channel_id: channelId, date: dateStrOffset(daysAgo) })
-            .then(res => {
-            const id = findDonorIdFromList(res && res.result && res.result.programs);
-            if (!id) return scanPast(channelId, daysAgo + 1);
-            return fetchShiftByDonor(channelId, id).then(url => {
-                if (url) return url;
-                return scanPast(channelId, daysAgo + 1);
+    function acquireShiftBase(channelId, component) {
+        const key = playbackKey(component);
+        dlog('[dev] acquire开始 ch=' + channelId, 'key=' + (key || '-'));
+        const memo = donorMemo[channelId];
+        if (memo && Date.now() - memo.at < DONOR_MEMO_TTL_MS) {
+            dlog('[dev] donor 记忆命中 id=' + memo.id);
+            return fetchShiftByDonor(channelId, memo.id).then(url => {
+                if (url) {
+                    return url;
+                }
+                delete donorMemo[channelId];
+                return acquireFromToday(channelId, component);
             });
-        });
+        }
+        return acquireFromToday(channelId, component);
+    }
+    const XTAB_LOCK_KEY = 'smg_shift_inflight';
+    const XTAB_LOCK_TTL_MS = 20000;
+    const XTAB_TAB_ID = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    function crossTabBusy(channelId) {
+        try {
+            const raw = LS.getItem(XTAB_LOCK_KEY);
+            if (!raw) {
+                return false;
+            }
+            const o = JSON.parse(raw);
+            return !!o && o.id !== XTAB_TAB_ID && String(o.ch) === String(channelId) &&
+                   Date.now() - o.at < XTAB_LOCK_TTL_MS;
+        } catch (e) {
+            return false;
+        }
+    }
+    function crossTabHold(channelId) {
+        try {
+            LS.setItem(XTAB_LOCK_KEY, JSON.stringify({ id: XTAB_TAB_ID, ch: String(channelId), at: Date.now() }));
+        } catch (e) {}
+    }
+    function crossTabRelease() {
+        try {
+            const raw = LS.getItem(XTAB_LOCK_KEY);
+            const o = raw ? JSON.parse(raw) : null;
+            if (o && o.id === XTAB_TAB_ID) {
+                LS.removeItem(XTAB_LOCK_KEY);
+            }
+        } catch (e) {}
     }
     function maybeAutoCaptureShift(component, fromMonitor, opts) {
         opts = opts || {};
@@ -794,15 +888,30 @@
             return false;
         }
         if (now - (component[cooldownKey] || 0) < 60000) {
-            dlog('[dev] 跳过取源：冷却中 剩余=' +
-                 Math.round((60000 - (now - component[cooldownKey])) / 1000) + 's');
+            throttleLog('shift-cooldown-' + chId, 5000, () => {
+                dlog('[dev] 跳过取源：冷却中 剩余=' +
+                     Math.round((60000 - (now - component[cooldownKey])) / 1000) + 's');
+            });
+            return false;
+        }
+        if (crossTabBusy(chId)) {
+            throttleLog('shift-xtab-' + chId, 5000, () => {
+                dlog('[dev] 跳过取源：另一标签页正在取源 ch=' + chId);
+            });
             return false;
         }
         component[cooldownKey] = now;
         component.__smgAcquiring = true;
-        acquireShiftBase(chId, component).then(ok => {
+        crossTabHold(chId);
+        acquireShiftBase(chId, component).catch(err => {
+            console.warn('[SMGTV] 取源异常：', err && err.message ? err.message : err);
+            return null;
+        }).then(ok => {
             component.__smgAcquiring = false;
+            crossTabRelease();
             if (ok) {
+                component[cooldownKey] = 0;
+                component.__smgAcquireFails = 0;
                 component.__smgNeedShiftBase = false;
                 if (component && typeof component.initPlayer === 'function' && opts.rebuild !== false) {
                     rememberPlaybackPosition(component, getPlayerVideo(component));
