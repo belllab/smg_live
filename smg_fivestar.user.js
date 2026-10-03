@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.24
+// @version          0.25
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -1491,6 +1491,43 @@
     function clearFullscreenIntent() {
         fullscreenRestore = null;
     }
+    function isStaleFallbackState() {
+        return !!document.body?.classList.contains(FULLSCREEN_FALLBACK_CLASS) ||
+            !!cssFullscreenFallbackPlayer ||
+            !!fullscreenFallbackTarget;
+    }
+    function resumeAfterRebuildRestore(component) {
+        let played = false;
+        let tries = 0;
+        const tick = () => {
+            tries += 1;
+            if (played || tries > 6) {
+                return;
+            }
+            const video = getPlayerVideo(component);
+            if (!video || !isLiveFullscreen(component)) {
+                return;
+            }
+            if (!video.paused || video.ended) {
+                played = true;
+                return;
+            }
+            try {
+                const player = component?.player;
+                if (player && typeof player.play === 'function') {
+                    player.play();
+                } else {
+                    const p = video.play();
+                    if (p && typeof p.catch === 'function') {
+                        p.catch(() => {});
+                    }
+                }
+                console.log('[SMGTV] 全屏恢复后已自动起播');
+            } catch (e) {}
+            setTimeout(tick, 1000);
+        };
+        setTimeout(tick, 300);
+    }
     function maybeRestoreFullscreen(component) {
         const pending = fullscreenRestore;
         if (!pending || !component) {
@@ -1518,8 +1555,11 @@
             return;
         }
         fullscreenRestore = null;
-        exitFallbackFullscreen(component);
+        if (isStaleFallbackState()) {
+            exitFallbackFullscreen(component);
+        }
         enterFallbackFullscreen(target, component);
+        resumeAfterRebuildRestore(component);
         console.log('[SMGTV] 播放源重建后已自动恢复全屏');
     }
     function callFullscreenMethod(fn) {
