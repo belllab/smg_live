@@ -6,8 +6,8 @@
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
 // @icon             https://live.kankanews.com/favicon.ico
-// @updateURL        https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
-// @downloadURL      https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js
+// @updateURL        https://raw.githubusercontent.com/belllab/smg_live/refs/heads/main/smg_fivestar.user.js
+// @downloadURL      https://raw.githubusercontent.com/belllab/smg_live/refs/heads/main/smg_fivestar.user.js
 // @run-at           document-start
 // @grant            GM_xmlhttpRequest
 // @grant            unsafeWindow
