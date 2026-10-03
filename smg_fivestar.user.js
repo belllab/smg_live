@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.23
+// @version          0.24
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -393,6 +393,9 @@
     let fullscreenFallbackTarget = null;
     let cssFullscreenFallbackPlayer = null;
     let lastFullscreenActionAt = 0;
+    let fullscreenRestore = null;
+    const FULLSCREEN_RESTORE_TTL_MS = 30000;
+    const REBUILD_METHODS = ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel'];
     const logThrottle = Object.create(null);
     function throttleLog(key, intervalMs, fn) {
         const now = Date.now();
@@ -1281,6 +1284,7 @@
         }
         const isReady = isVideoReady(video);
         setVideoReadyClass(isReady);
+        maybeRestoreFullscreen(component);
         if (isReady && component && component.isLoading) {
             component.isLoading = false;
         }
@@ -1449,6 +1453,75 @@
             !!cssFullscreenFallbackPlayer?.cssfullscreen ||
             !!cssFullscreenFallbackPlayer?.isCssfullScreen;
     }
+    function isLiveFullscreen(component) {
+        if (getBrowserFullscreenElement()) {
+            return true;
+        }
+        const video = getPlayerVideo(component);
+        if (video && video.webkitDisplayingFullscreen) {
+            return true;
+        }
+        if (fullscreenFallbackTarget) {
+            return fullscreenFallbackTarget.isConnected === true;
+        }
+        if (cssFullscreenFallbackPlayer) {
+            return cssFullscreenFallbackPlayer === component?.player;
+        }
+        return false;
+    }
+    function captureFullscreenIntent(component) {
+        let el = getBrowserFullscreenElement();
+        let mode = '';
+        if (el) {
+            mode = 'browser';
+        } else {
+            const video = getPlayerVideo(component);
+            if (video && video.webkitDisplayingFullscreen) {
+                mode = 'ios';
+                el = video;
+            } else if (isFallbackFullscreen()) {
+                mode = 'fallback';
+                el = fullscreenFallbackTarget || component?.player?.root || null;
+            }
+        }
+        if (mode && el) {
+            fullscreenRestore = { mode: mode, at: Date.now(), el: el };
+        }
+    }
+    function clearFullscreenIntent() {
+        fullscreenRestore = null;
+    }
+    function maybeRestoreFullscreen(component) {
+        const pending = fullscreenRestore;
+        if (!pending || !component) {
+            return;
+        }
+        if (Date.now() - pending.at > FULLSCREEN_RESTORE_TTL_MS) {
+            fullscreenRestore = null;
+            return;
+        }
+        if (pending.el && pending.el.isConnected) {
+            // 全屏元素仍在文档中：未发生重建，视为用户主动退出，放弃恢复
+            fullscreenRestore = null;
+            return;
+        }
+        if (isLiveFullscreen(component)) {
+            fullscreenRestore = null;
+            return;
+        }
+        const video = getPlayerVideo(component);
+        if (!isVideoReady(video)) {
+            return;
+        }
+        const target = getFullscreenTarget(component, null);
+        if (!target) {
+            return;
+        }
+        fullscreenRestore = null;
+        exitFallbackFullscreen(component);
+        enterFallbackFullscreen(target, component);
+        console.log('[SMGTV] 播放源重建后已自动恢复全屏');
+    }
     function callFullscreenMethod(fn) {
         try {
             const result = fn();
@@ -1525,8 +1598,10 @@
         syncLoadingState(component);
         const video = getPlayerVideo(component);
         if (getBrowserFullscreenElement() || isFallbackFullscreen()) {
+            clearFullscreenIntent();
             exitFullscreen(component);
         } else if (video && video.webkitDisplayingFullscreen) {
+            clearFullscreenIntent();
             try {
                 if (typeof video.webkitExitFullscreen === 'function') {
                     video.webkitExitFullscreen();
@@ -1558,6 +1633,7 @@
         document.addEventListener('MSFullscreenChange', handleFullscreenChange);
         document.addEventListener('keydown', event => {
             if (event.key === 'Escape' && isFallbackFullscreen()) {
+                clearFullscreenIntent();
                 exitFallbackFullscreen(findTVComponent());
             }
         });
@@ -1581,6 +1657,9 @@
                 clearResumePosition(this);
             }
             ensurePlayableStream(this);
+            if (REBUILD_METHODS.indexOf(methodName) !== -1) {
+                captureFullscreenIntent(this);
+            }
             const result = original.apply(this, arguments);
             const runAfter = () => {
                 ensurePlayableStream(this);
