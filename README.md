@@ -30,7 +30,7 @@
 
 | 正式版 (GitHub 源)                                                                           |
 |---------------------------------------------------------------------------------------------|
-| [安装](https://raw.githubusercontent.com/Popukok/smg_live/refs/heads/main/smg_fivestar.user.js)  |
+| [安装](https://raw.githubusercontent.com/belllab/smg_live/refs/heads/main/smg_fivestar.user.js)  |
 
 3. 打开 [SMG 直播页面](https://live.kankanews.com/huikan?id=10)，选择频道即可观看
 
