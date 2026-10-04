@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.25
+// @version          0.26
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -1419,6 +1419,8 @@
             try {
                 player.getCssFullscreen(target);
                 cssFullscreenFallbackPlayer = player;
+                // 记录目标元素：状态判定只依赖脚本自身标记，不依赖 xgplayer 内部属性
+                fullscreenFallbackTarget = target;
                 syncFullscreenButtonState(component, true);
                 return;
             } catch (e) {
@@ -1449,9 +1451,10 @@
         syncFullscreenButtonState(component, false);
     }
     function isFallbackFullscreen() {
+        // 只依赖脚本自身维护的标记；xgplayer 的 .cssfullscreen/.isCssfullScreen
+        // 属性名在不同版本不一致，不能作为判定依据
         return !!document.body?.classList.contains(FULLSCREEN_FALLBACK_CLASS) ||
-            !!cssFullscreenFallbackPlayer?.cssfullscreen ||
-            !!cssFullscreenFallbackPlayer?.isCssfullScreen;
+            !!cssFullscreenFallbackPlayer;
     }
     function isLiveFullscreen(component) {
         if (getBrowserFullscreenElement()) {
@@ -1603,8 +1606,9 @@
         const player = component?.player;
         if (isFallbackFullscreen()) {
             exitFallbackFullscreen(component);
-            return;
         }
+        // 原生全屏退出无条件执行：即使存在残留的兜底标记也不能跳过，
+        // exitBrowserFullscreen 在非原生全屏时为无害空操作
         const exitNative = callFullscreenMethod(() => (
             player && typeof player.exitFullscreen === 'function' ?
             player.exitFullscreen() :
