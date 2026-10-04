@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name             收看SMGTV电视节目
 // @namespace        http://tampermonkey.net/
-// @version          0.26
+// @version          0.27
 // @description      收看SMGTV，并解除页面部分限制
 // @author           https://github.com/Popukok
 // @match            *://*.kankanews.com/huikan*
@@ -394,6 +394,7 @@
     let cssFullscreenFallbackPlayer = null;
     let lastFullscreenActionAt = 0;
     let fullscreenRestore = null;
+    let lastNativeFsElement = null;
     const FULLSCREEN_RESTORE_TTL_MS = 30000;
     const REBUILD_METHODS = ['initPlayer', 'initNoProgramPlayer', 'initPadPlayer', 'changeProgram', 'changeChannel'];
     const logThrottle = Object.create(null);
@@ -1489,6 +1490,15 @@
         }
         if (mode && el) {
             fullscreenRestore = { mode: mode, at: Date.now(), el: el };
+            console.log('[SMGTV] 已记录全屏恢复意图 mode=' + mode);
+        } else {
+            throttleLog('fs-capture-miss', 10000, () => {
+                console.log('[SMGTV] 重建时未处于全屏，跳过意图记录',
+                    'browser=', !!getBrowserFullscreenElement(),
+                    'fallback=', isFallbackFullscreen(),
+                    'target=', !!fullscreenFallbackTarget,
+                    'cssPlayer=', !!cssFullscreenFallbackPlayer);
+            });
         }
     }
     function clearFullscreenIntent() {
@@ -1538,23 +1548,28 @@
         }
         if (Date.now() - pending.at > FULLSCREEN_RESTORE_TTL_MS) {
             fullscreenRestore = null;
+            throttleLog('fs-restore-ttl', 5000, () => console.log('[SMGTV] 全屏恢复意图已过期，放弃'));
             return;
         }
         if (pending.el && pending.el.isConnected) {
             // 全屏元素仍在文档中：未发生重建，视为用户主动退出，放弃恢复
             fullscreenRestore = null;
+            throttleLog('fs-restore-live', 5000, () => console.log('[SMGTV] 全屏元素未销毁，放弃恢复（视为主动退出）'));
             return;
         }
         if (isLiveFullscreen(component)) {
             fullscreenRestore = null;
+            throttleLog('fs-restore-alive', 5000, () => console.log('[SMGTV] 检测到已在全屏，清除恢复意图'));
             return;
         }
         const video = getPlayerVideo(component);
         if (!isVideoReady(video)) {
+            throttleLog('fs-restore-wait', 5000, () => console.log('[SMGTV] 等待播放器就绪后恢复全屏'));
             return;
         }
         const target = getFullscreenTarget(component, null);
         if (!target) {
+            throttleLog('fs-restore-notarget', 5000, () => console.log('[SMGTV] 未找到全屏目标元素，暂缓恢复'));
             return;
         }
         fullscreenRestore = null;
@@ -1659,13 +1674,36 @@
         }
     }
     function handleFullscreenChange() {
-        if (getBrowserFullscreenElement()) {
+        const fsEl = getBrowserFullscreenElement();
+        if (fsEl) {
+            lastNativeFsElement = fsEl;
             if (isFallbackFullscreen()) {
                 exitFallbackFullscreen(findTVComponent());
             }
             syncFullscreenButtonState(findTVComponent(), true);
-        } else if (!isFallbackFullscreen()) {
+            return;
+        }
+        if (!isFallbackFullscreen()) {
             syncFullscreenButtonState(findTVComponent(), false);
+        }
+        // 响应式兜底：原生全屏退出且非用户操作引起时，若全屏元素随后被移出文档
+        // （重建销毁），自动设置恢复意图。Esc/按钮退出时元素仍在文档中，不会误恢复。
+        const exitedEl = lastNativeFsElement;
+        lastNativeFsElement = null;
+        if (exitedEl) {
+            const armReactiveIntent = () => {
+                if (getBrowserFullscreenElement() || fullscreenRestore) {
+                    return;
+                }
+                if (exitedEl.isConnected) {
+                    throttleLog('fs-reactive-skip', 5000, () =>
+                        console.log('[SMGTV] 原生全屏退出但元素未销毁，不自动恢复'));
+                    return;
+                }
+                fullscreenRestore = { mode: 'browser', at: Date.now(), el: exitedEl };
+                console.log('[SMGTV] 检测到全屏元素被销毁，已布防自动恢复');
+            };
+            setTimeout(armReactiveIntent, 600);
         }
     }
     function initFullscreenPatch() {
